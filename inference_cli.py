@@ -1176,8 +1176,8 @@ def _stitch_spilled_chunks(
             else:
                 chunk_body = chunk_tensor
 
-        if chunk_body.numel() > 0:
-            frames_written += write_out(chunk_body)
+            if chunk_body.numel() > 0:
+                frames_written += write_out(chunk_body)
 
             try:
                 os.remove(chunk_path)
