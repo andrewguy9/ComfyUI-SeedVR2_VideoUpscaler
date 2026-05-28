@@ -205,21 +205,32 @@ class FFMPEGVideoWriter:
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
-    
+        # Drain stderr in background to prevent pipe-buffer deadlock when ffmpeg
+        # writes enough warnings to fill the 64KB OS pipe buffer while Python is
+        # blocked writing frames to stdin.
+        self._stderr_buf: list[bytes] = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        for line in self.proc.stderr:
+            self._stderr_buf.append(line)
+
     def write(self, frame_bgr: np.ndarray):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         self.proc.stdin.write(frame_rgb.astype(self._input_dtype).tobytes())
-    
+
     def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
-    
+
     def release(self):
         if self.proc:
             self.proc.stdin.close()
             self.proc.wait()
-            stderr = self.proc.stderr.read() if self.proc.stderr else b''
+            self._stderr_thread.join(timeout=5.0)
             if self.proc.returncode != 0:
-                debug.log(f"ffmpeg error: {stderr.decode()}", level="WARNING", category="file")
+                stderr = b"".join(self._stderr_buf).decode(errors="replace")
+                debug.log(f"ffmpeg error: {stderr}", level="WARNING", category="file")
             self.proc = None
 
 
