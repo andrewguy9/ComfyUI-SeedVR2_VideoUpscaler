@@ -1643,17 +1643,19 @@ def _gpu_processing(
             })
             seg_start = base_end
 
-        frames_written_total = 0
         cycle_index = 0
-        writer = None
         pix_fmt = _resolve_pix_fmt(args)
         codec = _resolve_codec(args)
+        # Accumulate all chunk paths per worker across all cycles before stitching.
+        # Stitching inside the cycle loop would interleave GPU0/GPU1 output at every
+        # cycle boundary (GPU0-cycle1 | GPU1-cycle1 | GPU0-cycle2 | ...) instead of
+        # emitting the two halves in order (all GPU0 | all GPU1).
+        all_worker_chunks: Dict[int, List[str]] = {state["idx"]: [] for state in device_states}
 
         # Process cycles until all device segments are consumed
         while any(state["cursor"] < state["final_end"] for state in device_states):
             cycle_index += 1
             workers = []
-            worker_chunks: Dict[int, List[str]] = {}
 
             # Spawn workers for devices that still have remaining frames
             for state in device_states:
@@ -1693,7 +1695,7 @@ def _gpu_processing(
                 proc_idx, payload = return_queue.get()
                 if isinstance(payload, dict) and "error" in payload:
                     raise RuntimeError(f"Worker {proc_idx} failed to spill chunk: {payload['error']}")
-                worker_chunks[proc_idx] = payload
+                all_worker_chunks[proc_idx].extend(payload)
                 collected += 1
 
             for p in workers:
@@ -1704,16 +1706,16 @@ def _gpu_processing(
                 if monitor_thread:
                     monitor_thread.join(timeout=2.0)
 
-            _log_ram_usage(debug, f"Parent pre-stitch cycle {cycle_index}", force=True)
-            frames_written, writer = _stitch_spilled_chunks(
-                worker_chunks, args, fps, output_path, base_name, writer=writer, pix_fmt=pix_fmt, codec=codec
-            )
-            frames_written_total += frames_written
-            _log_ram_usage(debug, f"Parent post-stitch cycle {cycle_index}", force=True)
+        _log_ram_usage(debug, f"Parent pre-stitch", force=True)
+        writer = None
+        frames_written, writer = _stitch_spilled_chunks(
+            all_worker_chunks, args, fps, output_path, base_name, writer=writer, pix_fmt=pix_fmt, codec=codec
+        )
+        _log_ram_usage(debug, f"Parent post-stitch", force=True)
 
         if writer is not None:
             writer.release()
-        return {"frames_written": frames_written_total}
+        return {"frames_written": frames_written}
     
     # Pre-loaded frames mode (original behavior for images or non-streaming)
     else:
