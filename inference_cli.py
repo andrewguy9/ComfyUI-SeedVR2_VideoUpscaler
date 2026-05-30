@@ -1486,7 +1486,8 @@ def _worker_process(
         spill_root = shared_args.get("spill_dir")
         if spill_root is None:
             raise RuntimeError("spill_dir not provided for streaming worker")
-        worker_spill_dir = os.path.join(spill_root, f"worker_{proc_idx}")
+        cycle_subdir = video_info.get("cycle_subdir", "")
+        worker_spill_dir = os.path.join(spill_root, f"worker_{proc_idx}", cycle_subdir) if cycle_subdir else os.path.join(spill_root, f"worker_{proc_idx}")
         os.makedirs(worker_spill_dir, exist_ok=True)
 
         for chunk_idx, result in enumerate(_stream_video_chunks(
@@ -1669,6 +1670,7 @@ def _gpu_processing(
                     'video_path': video_path,
                     'start_frame': start_cur,
                     'end_frame': end_cur,
+                    'cycle_subdir': f"cycle_{cycle_index:05d}",
                 }
 
                 os.environ["CUDA_VISIBLE_DEVICES"] = state["device"]
