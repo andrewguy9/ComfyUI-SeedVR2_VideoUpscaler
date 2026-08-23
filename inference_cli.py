@@ -1102,37 +1102,44 @@ def _resolve_codec(args: argparse.Namespace) -> Optional[str]:
     return "libx264" if args.output_bitdepth <= 8 else "libx265"
 
 
-def _stitch_spilled_chunks(
-    worker_chunks: Dict[int, List[str]],
+def _stitch_worker_chunks(
+    chunk_paths: List[str],
     args: argparse.Namespace,
     fps: float,
     output_path: str,
     base_name: str,
-    writer: Optional[cv2.VideoWriter] = None,
-    pix_fmt: Optional[str] = None,
-    codec: Optional[str] = None
+    is_last_worker: bool,
+    writer: Optional[cv2.VideoWriter],
+    pix_fmt: Optional[str],
+    codec: Optional[str],
+    state: Dict[str, Any]
 ) -> Tuple[int, Optional[cv2.VideoWriter]]:
     """
-    Stitch spilled chunks from multiple workers with overlap blending and stream to disk.
+    Stitch one timeline segment's spilled chunks with overlap blending and stream to disk.
+
+    Segments must be flushed in ascending timeline order (the caller is responsible for
+    this) so that output frames stay temporally ordered. `state` carries `pending_tail` (the
+    previous segment's trailing overlap frames, held back until blended against this
+    segment's first chunk) and `frames_to_skip` (remaining prepend-frame trim) across calls
+    so that each segment's chunks can be stitched and deleted as soon as that segment
+    finishes, instead of waiting for the entire video to be spilled to disk first.
+    `is_last_worker` is True only for the final segment of the whole video.
     """
     frames_written = 0
-    pending_tail: Optional[torch.Tensor] = None
     overlap = args.temporal_overlap
-    last_worker_idx = max(worker_chunks.keys())
     pix_fmt = pix_fmt or _resolve_pix_fmt(args)
     codec = codec or _resolve_codec(args)
-    frames_to_skip = args.prepend_frames
 
     def write_out(chunk_tensor: torch.Tensor) -> int:
-        nonlocal writer, frames_to_skip
+        nonlocal writer
         if chunk_tensor.numel() == 0:
             return 0
-        if frames_to_skip > 0:
-            if chunk_tensor.shape[0] <= frames_to_skip:
-                frames_to_skip -= chunk_tensor.shape[0]
+        if state["frames_to_skip"] > 0:
+            if chunk_tensor.shape[0] <= state["frames_to_skip"]:
+                state["frames_to_skip"] -= chunk_tensor.shape[0]
                 return 0
-            chunk_tensor = chunk_tensor[frames_to_skip:]
-            frames_to_skip = 0
+            chunk_tensor = chunk_tensor[state["frames_to_skip"]:]
+            state["frames_to_skip"] = 0
         if args.output_format == "png":
             return save_frames_to_image(chunk_tensor, output_path, base_name, start_index=frames_written)
         _log_ram_usage(debug, "Stitch write_out pre-video", force=True)
@@ -1155,50 +1162,50 @@ def _stitch_spilled_chunks(
             writer = writer_local
         return chunk_tensor.shape[0]
 
-    for worker_idx in sorted(worker_chunks.keys()):
-        chunk_paths = sorted(worker_chunks[worker_idx])
-        for chunk_idx, chunk_path in enumerate(chunk_paths):
-            chunk_np = _load_spilled_chunk(chunk_path, args.output_bitdepth)
-            chunk_tensor = torch.from_numpy(chunk_np)
-            is_last_worker = worker_idx == last_worker_idx
-            is_last_chunk = chunk_idx == len(chunk_paths) - 1
+    chunk_paths = sorted(chunk_paths)
+    for chunk_idx, chunk_path in enumerate(chunk_paths):
+        chunk_np = _load_spilled_chunk(chunk_path, args.output_bitdepth)
+        chunk_tensor = torch.from_numpy(chunk_np)
+        is_last_chunk = chunk_idx == len(chunk_paths) - 1
 
-            if pending_tail is not None:
-                if overlap > 0 and chunk_tensor.shape[0] > 0:
-                    blend_len = min(overlap, pending_tail.shape[0], chunk_tensor.shape[0])
-                    blended = blend_overlapping_frames(
-                        pending_tail[-blend_len:],
-                        chunk_tensor[:blend_len],
-                        blend_len
-                    )
-                    frames_written += write_out(blended)
-                    chunk_tensor = chunk_tensor[blend_len:]
-                else:
-                    frames_written += write_out(pending_tail)
-                pending_tail = None
-
-            if not is_last_worker and overlap > 0 and is_last_chunk:
-                if chunk_tensor.shape[0] <= overlap:
-                    pending_tail = chunk_tensor
-                    chunk_body = chunk_tensor[:0]
-                else:
-                    pending_tail = chunk_tensor[-overlap:]
-                    chunk_body = chunk_tensor[:-overlap]
+        pending_tail = state["pending_tail"]
+        if pending_tail is not None:
+            if overlap > 0 and chunk_tensor.shape[0] > 0:
+                blend_len = min(overlap, pending_tail.shape[0], chunk_tensor.shape[0])
+                blended = blend_overlapping_frames(
+                    pending_tail[-blend_len:],
+                    chunk_tensor[:blend_len],
+                    blend_len
+                )
+                frames_written += write_out(blended)
+                chunk_tensor = chunk_tensor[blend_len:]
             else:
-                chunk_body = chunk_tensor
+                frames_written += write_out(pending_tail)
+            state["pending_tail"] = None
 
-            if chunk_body.numel() > 0:
-                frames_written += write_out(chunk_body)
+        if not is_last_worker and overlap > 0 and is_last_chunk:
+            if chunk_tensor.shape[0] <= overlap:
+                state["pending_tail"] = chunk_tensor
+                chunk_body = chunk_tensor[:0]
+            else:
+                state["pending_tail"] = chunk_tensor[-overlap:]
+                chunk_body = chunk_tensor[:-overlap]
+        else:
+            chunk_body = chunk_tensor
 
-            try:
-                os.remove(chunk_path)
-            except OSError:
-                pass
-            del chunk_tensor, chunk_np
-            gc.collect()
+        if chunk_body.numel() > 0:
+            frames_written += write_out(chunk_body)
 
-    if pending_tail is not None:
-        frames_written += write_out(pending_tail)
+        try:
+            os.remove(chunk_path)
+        except OSError:
+            pass
+        del chunk_tensor, chunk_np
+        gc.collect()
+
+    if is_last_worker and state["pending_tail"] is not None:
+        frames_written += write_out(state["pending_tail"])
+        state["pending_tail"] = None
 
     return frames_written, writer
 
@@ -1487,7 +1494,7 @@ def _worker_process(
         if spill_root is None:
             raise RuntimeError("spill_dir not provided for streaming worker")
         cycle_subdir = video_info.get("cycle_subdir", "")
-        worker_spill_dir = os.path.join(spill_root, f"worker_{proc_idx}", cycle_subdir) if cycle_subdir else os.path.join(spill_root, f"worker_{proc_idx}")
+        worker_spill_dir = os.path.join(spill_root, f"segment_{proc_idx}", cycle_subdir) if cycle_subdir else os.path.join(spill_root, f"segment_{proc_idx}")
         os.makedirs(worker_spill_dir, exist_ok=True)
 
         for chunk_idx, result in enumerate(_stream_video_chunks(
@@ -1615,68 +1622,73 @@ def _gpu_processing(
     if spill_dir:
         shared_args["spill_dir"] = spill_dir
     
-    # Video streaming mode: distribute frame ranges to workers
+    # Video streaming mode: distribute frame ranges to workers round-robin, one
+    # contiguous segment per device per round, in ascending timeline order.
     recycle_every = max(1, getattr(args, "recycle_workers_every", 1))
     if video_info is not None and spill_dir:
         total_frames = video_info['frames_to_process']
         start_frame = video_info['start_frame']
         video_path = video_info['video_path']
-        base_per_gpu = total_frames // num_devices
-        remainder = total_frames % num_devices
 
-        cycle_span = (args.chunk_size if args.chunk_size > 0 else max(1, base_per_gpu))
+        cycle_span = (args.chunk_size if args.chunk_size > 0 else max(1, -(-total_frames // num_devices)))
         cycle_span *= recycle_every
 
-        # Build per-device segments
-        device_states = []
+        # Build the full ordered list of timeline segments up front (round-robin: segment i
+        # is handled by device i % num_devices). Every non-final segment is extended by
+        # `overlap` extra frames past its nominal end so it shares real source-video frames
+        # with the next segment's head, matching the pre-existing per-GPU-seam blending
+        # design in _stitch_worker_chunks -- just generalized to every segment boundary
+        # instead of only the num_devices-1 GPU-to-GPU boundaries.
+        segments = []
         seg_start = start_frame
-        for idx in range(num_devices):
-            gpu_frames = base_per_gpu + (1 if idx < remainder else 0)
-            base_end = seg_start + gpu_frames
-            final_end = base_end + (overlap if idx < num_devices - 1 else 0)
-            device_states.append({
-                "idx": idx,
-                "device": device_list[idx],
-                "cursor": seg_start,
-                "final_end": final_end,
-                "start_base": seg_start,
-                "total_frames": final_end - seg_start
+        end_of_video = start_frame + total_frames
+        seg_idx = 0
+        while seg_start < end_of_video:
+            nominal_end = min(seg_start + cycle_span, end_of_video)
+            is_final_segment = nominal_end >= end_of_video
+            final_end = nominal_end if is_final_segment else min(nominal_end + overlap, end_of_video)
+            segments.append({
+                "seg_idx": seg_idx,
+                "start": seg_start,
+                "end": final_end,
             })
-            seg_start = base_end
+            seg_start = nominal_end
+            seg_idx += 1
 
-        cycle_index = 0
+        last_seg_idx = len(segments) - 1
         pix_fmt = _resolve_pix_fmt(args)
         codec = _resolve_codec(args)
-        # Accumulate all chunk paths per worker across all cycles before stitching.
-        # Stitching inside the cycle loop would interleave GPU0/GPU1 output at every
-        # cycle boundary (GPU0-cycle1 | GPU1-cycle1 | GPU0-cycle2 | ...) instead of
-        # emitting the two halves in order (all GPU0 | all GPU1).
-        all_worker_chunks: Dict[int, List[str]] = {state["idx"]: [] for state in device_states}
+        writer = None
+        stitch_state: Dict[str, Any] = {"pending_tail": None, "frames_to_skip": args.prepend_frames}
+        frames_written = 0
 
-        # Process cycles until all device segments are consumed
-        while any(state["cursor"] < state["final_end"] for state in device_states):
-            cycle_index += 1
+        # Process rounds of up to num_devices segments (in timeline order) at a time.
+        # Each round's segments are stitched and their spilled chunks deleted immediately
+        # after that round completes, before the next round is dispatched. This bounds
+        # spill-dir disk usage to roughly one round's worth of frames across all GPUs,
+        # for the entire job -- not just at the end.
+        round_index = 0
+        next_seg = 0
+        while next_seg <= last_seg_idx:
+            round_index += 1
+            round_segments = segments[next_seg:next_seg + num_devices]
+            next_seg += len(round_segments)
+
             workers = []
-
-            # Spawn workers for devices that still have remaining frames
-            for state in device_states:
-                if state["cursor"] >= state["final_end"]:
-                    continue
-                start_cur = state["cursor"]
-                end_cur = min(state["final_end"], start_cur + cycle_span)
-                state["cursor"] = end_cur
+            for slot, seg in enumerate(round_segments):
+                device = device_list[slot]
 
                 worker_video_info = {
                     'video_path': video_path,
-                    'start_frame': start_cur,
-                    'end_frame': end_cur,
-                    'cycle_subdir': f"cycle_{cycle_index:05d}",
+                    'start_frame': seg["start"],
+                    'end_frame': seg["end"],
+                    'cycle_subdir': f"cycle_{round_index:05d}",
                 }
 
-                os.environ["CUDA_VISIBLE_DEVICES"] = state["device"]
+                os.environ["CUDA_VISIBLE_DEVICES"] = device
                 p = mp.Process(
                     target=_worker_process,
-                    args=(state["idx"], state["device"], None, shared_args, return_queue, done_barrier),
+                    args=(seg["seg_idx"], device, None, shared_args, return_queue, done_barrier),
                     kwargs={'video_info': worker_video_info}
                 )
                 p.start()
@@ -1688,16 +1700,17 @@ def _gpu_processing(
                 monitor_stop, monitor_thread = _start_memory_monitor(
                     [p.pid for p in workers if p.pid],
                     debug,
-                    label=f"workers_cycle_{cycle_index}",
+                    label=f"workers_cycle_{round_index}",
                     interval=10.0
                 )
 
+            round_chunks: Dict[int, List[str]] = {}
             collected = 0
             while collected < len(workers):
                 proc_idx, payload = return_queue.get()
                 if isinstance(payload, dict) and "error" in payload:
                     raise RuntimeError(f"Worker {proc_idx} failed to spill chunk: {payload['error']}")
-                all_worker_chunks[proc_idx].extend(payload)
+                round_chunks[proc_idx] = payload
                 collected += 1
 
             for p in workers:
@@ -1708,12 +1721,19 @@ def _gpu_processing(
                 if monitor_thread:
                     monitor_thread.join(timeout=2.0)
 
-        _log_ram_usage(debug, f"Parent pre-stitch", force=True)
-        writer = None
-        frames_written, writer = _stitch_spilled_chunks(
-            all_worker_chunks, args, fps, output_path, base_name, writer=writer, pix_fmt=pix_fmt, codec=codec
-        )
-        _log_ram_usage(debug, f"Parent post-stitch", force=True)
+            # Stitch this round's segments in ascending timeline order, then delete.
+            for seg in round_segments:
+                is_last_segment = seg["seg_idx"] == last_seg_idx
+                _log_ram_usage(debug, f"Parent pre-stitch segment {seg['seg_idx']}", force=True)
+                written, writer = _stitch_worker_chunks(
+                    round_chunks[seg["seg_idx"]],
+                    args, fps, output_path, base_name,
+                    is_last_worker=is_last_segment,
+                    writer=writer, pix_fmt=pix_fmt, codec=codec,
+                    state=stitch_state
+                )
+                frames_written += written
+                _log_ram_usage(debug, f"Parent post-stitch segment {seg['seg_idx']}", force=True)
 
         if writer is not None:
             writer.release()
@@ -1754,10 +1774,6 @@ def _gpu_processing(
             label="workers",
             interval=10.0
         )
-
-    if video_info is not None and spill_dir:
-        # This path is now handled in the loop above
-        return {"frames_written": 0}
 
     # Collect results before joining to prevent deadlock (pre-loaded frames path)
     results_np = [None] * num_devices
