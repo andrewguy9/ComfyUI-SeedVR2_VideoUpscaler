@@ -1506,10 +1506,18 @@ def _worker_process(
     
     # Queue-driven streaming mode: pull work items until the sentinel arrives.
     if work_queue is not None:
-        # Pin this child to its GPU here rather than in the parent: proxies
-        # respawn independently, so mutating the parent's environment around
-        # each spawn would race between concurrent restarts.
-        os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+        # NOTE: CUDA_VISIBLE_DEVICES must be set by the parent before spawn, not
+        # here. Under 'spawn' the child re-imports this module to reach this
+        # function, and that import initializes torch/CUDA long before any line
+        # in this body runs -- setting it here would come too late and every
+        # worker would land on device 0.
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible != device_id:
+            worker_debug.log(
+                f"Worker {proc_idx} expected CUDA_VISIBLE_DEVICES={device_id} but inherited "
+                f"{visible!r}; GPU assignment is wrong",
+                level="WARNING", category="warning", force=True
+            )
         worker_debug.log(f"Worker {proc_idx} (GPU {device_id}) ready", category="generation", force=True)
         spill_root = shared_args.get("spill_dir")
         if spill_root is None:
@@ -1688,6 +1696,11 @@ def _single_gpu_direct_processing(
 # treating it as a fatal error. Guards against an infinite respawn loop when
 # workers die immediately on startup.
 _MAX_POOL_REVIVALS = 3
+
+# Serializes worker spawns. Each child inherits CUDA_VISIBLE_DEVICES from the
+# parent's environment at spawn time, so two proxies restarting at once must not
+# be setting that variable concurrently.
+_SPAWN_LOCK = threading.Lock()
 
 
 def _format_duration(seconds: float) -> str:
@@ -2148,15 +2161,26 @@ class _WorkerProxy:
         self.generation = 0
 
     def start(self) -> None:
-        # The child pins itself to device_id; doing it here would race with
-        # other proxies restarting concurrently.
-        self.process = mp.Process(
-            target=_worker_process,
-            args=(self.proc_idx, self.device_id, None, self.shared_args, self.return_queue, None),
-            kwargs={"work_queue": self.work_queue},
-            daemon=False,
-        )
-        self.process.start()
+        # The child inherits CUDA_VISIBLE_DEVICES at spawn time and cannot set
+        # it for itself: importing this module in the child initializes CUDA
+        # before any worker code runs. Spawns are serialized under a lock so
+        # concurrent restarts can't read each other's value.
+        with _SPAWN_LOCK:
+            previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.device_id
+            try:
+                self.process = mp.Process(
+                    target=_worker_process,
+                    args=(self.proc_idx, self.device_id, None, self.shared_args, self.return_queue, None),
+                    kwargs={"work_queue": self.work_queue},
+                    daemon=False,
+                )
+                self.process.start()
+            finally:
+                if previous is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = previous
 
     def restart(self) -> None:
         self.generation += 1
