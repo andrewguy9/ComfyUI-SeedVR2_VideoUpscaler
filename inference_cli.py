@@ -1115,9 +1115,9 @@ class _OrderedChunkWriter:
     Overlap context is trimmed by the worker before spilling (prepend-and-trim),
     so chunks are already non-overlapping here and simply concatenate in order.
 
-    `retire_callback` is invoked with the sequence number once a chunk has been
+    `retire_callback(seq, frames_written)` is invoked once a chunk has been
     written and its spill file deleted, so the coordinator can return its
-    in-flight credit.
+    in-flight credit and report progress against real output.
     """
 
     def __init__(
@@ -1160,6 +1160,7 @@ class _OrderedChunkWriter:
 
     def _write_chunk(self, message: Dict[str, Any]) -> None:
         chunk_path = message["chunk_path"]
+        before = self.frames_written
         try:
             chunk_np = _load_spilled_chunk(chunk_path, self.args.output_bitdepth)
             chunk_tensor = torch.from_numpy(chunk_np)
@@ -1172,7 +1173,9 @@ class _OrderedChunkWriter:
             except OSError:
                 pass
             if self.retire_callback is not None:
-                self.retire_callback(message["seq"])
+                # Report frames that actually reached the output, which excludes
+                # anything trimmed by prepend_frames.
+                self.retire_callback(message["seq"], self.frames_written - before)
 
     def _write_out(self, chunk_tensor: torch.Tensor) -> None:
         if chunk_tensor.numel() == 0:
@@ -1687,6 +1690,110 @@ def _single_gpu_direct_processing(
 _MAX_POOL_REVIVALS = 3
 
 
+def _format_duration(seconds: float) -> str:
+    """Render a duration as compact h/m/s, e.g. '1h 04m', '7m 12s', '45s'."""
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return "--"
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+class _PipelineProgress:
+    """
+    Whole-file progress, measured at the writer.
+
+    Counts only frames that have actually been written in order, so the
+    percentage never runs ahead of real output. Rate is taken over a trailing
+    window rather than the whole run, so the ETA reacts when throughput changes
+    (a straggler, a recycle stall) instead of being dragged by early history.
+    """
+
+    def __init__(
+        self,
+        total_frames: int,
+        total_chunks: int,
+        debug: 'Debug',
+        interval: float = 20.0,
+        window: int = 12
+    ) -> None:
+        self.total_frames = max(0, total_frames)
+        self.total_chunks = total_chunks
+        self.debug = debug
+        self.interval = interval
+        self.started = time.time()
+        self.last_log = self.started
+        self.frames_done = 0
+        self.chunks_done = 0
+        # Trailing (timestamp, frames_done) samples for the rate estimate.
+        self.samples: List[Tuple[float, int]] = [(self.started, 0)]
+        self.window = window
+
+    def advance(self, frames: int) -> None:
+        now = time.time()
+        self.frames_done += max(0, frames)
+        self.chunks_done += 1
+        self.samples.append((now, self.frames_done))
+        if len(self.samples) > self.window:
+            self.samples.pop(0)
+        if now - self.last_log >= self.interval or self.chunks_done == self.total_chunks:
+            self.last_log = now
+            self._emit(now)
+
+    def heartbeat(self) -> None:
+        """
+        Re-emit while nothing is retiring. Chunks only retire in order, so a
+        single slow worker can go minutes without advancing the line; without
+        this the run looks hung when it is merely waiting on one chunk.
+        """
+        now = time.time()
+        if now - self.last_log >= self.interval:
+            self.last_log = now
+            self._emit(now)
+
+    def _recent_fps(self, now: float) -> float:
+        """
+        Frames per second over the trailing window, measured against `now`
+        rather than the last sample, so time spent stalled drags the rate down
+        instead of leaving a stale pre-stall figure on screen.
+        """
+        if not self.samples:
+            return 0.0
+        t0, f0 = self.samples[0]
+        span = now - t0
+        return (self.frames_done - f0) / span if span > 0 else 0.0
+
+    def _emit(self, now: float) -> None:
+        elapsed = now - self.started
+        fps = self._recent_fps(now)
+        parts = [f"{self.chunks_done}/{self.total_chunks} chunks"]
+        if self.total_frames:
+            pct = 100.0 * self.frames_done / self.total_frames
+            parts.insert(0, f"{pct:5.1f}%")
+            parts.append(f"{self.frames_done}/{self.total_frames} frames")
+        if fps > 0:
+            parts.append(f"{fps:.1f} fps")
+            remaining = self.total_frames - self.frames_done if self.total_frames else 0
+            if remaining > 0:
+                parts.append(f"ETA {_format_duration(remaining / fps)}")
+        parts.append(f"elapsed {_format_duration(elapsed)}")
+        self.debug.log(" | ".join(parts), category="timing", force=True)
+
+    def finish(self) -> None:
+        elapsed = time.time() - self.started
+        avg = self.frames_done / elapsed if elapsed > 0 else 0.0
+        self.debug.log(
+            f"Wrote {self.frames_done} frames in {_format_duration(elapsed)}"
+            + (f" ({avg:.1f} fps average)" if avg > 0 else ""),
+            category="success", force=True
+        )
+
+
 def _plan_chunk_work(
     video_path: str,
     start_frame: int,
@@ -1803,11 +1910,23 @@ def _run_chunk_pipeline(
     failure: Optional[Dict[str, Any]] = None
     measured = False
 
-    def on_retire(_seq: int) -> None:
+    # prepend_frames are decoded for temporal context at the very start and
+    # dropped by the writer, so they never reach the output file.
+    progress = _PipelineProgress(
+        total_frames=max(
+            0,
+            sum(item["payload_frames"] for item in work_items) - max(0, args.prepend_frames)
+        ),
+        total_chunks=total_items,
+        debug=debug,
+    )
+
+    def on_retire(_seq: int, frames: int) -> None:
         """A chunk is written and its spill file gone: return its credit."""
         nonlocal in_flight, retired
         in_flight -= 1
         retired += 1
+        progress.advance(frames)
 
     writer_stage.retire_callback = on_retire
 
@@ -1850,6 +1969,7 @@ def _run_chunk_pipeline(
                         continue
                     failure = {"error": "worker pool repeatedly exited before the job completed"}
                     break
+                progress.heartbeat()
                 continue
 
             kind = message.get("type")
@@ -1902,6 +2022,7 @@ def _run_chunk_pipeline(
             for proxy in proxies:
                 proxy.join(timeout=30.0)
             frames_written = writer_stage.finish(expected_total=total_items)
+            progress.finish()
         else:
             # Fatal error: stop the workers before touching the output so no
             # late spill file lands after cleanup.
