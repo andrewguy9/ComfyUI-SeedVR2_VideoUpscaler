@@ -53,6 +53,8 @@ import multiprocessing as mp
 import tempfile
 import threading
 import gc
+import traceback
+import queue
 from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
 from datetime import datetime
 from pathlib import Path
@@ -1102,112 +1104,141 @@ def _resolve_codec(args: argparse.Namespace) -> Optional[str]:
     return "libx264" if args.output_bitdepth <= 8 else "libx265"
 
 
-def _stitch_worker_chunks(
-    chunk_paths: List[str],
-    args: argparse.Namespace,
-    fps: float,
-    output_path: str,
-    base_name: str,
-    is_last_worker: bool,
-    writer: Optional[cv2.VideoWriter],
-    pix_fmt: Optional[str],
-    codec: Optional[str],
-    state: Dict[str, Any]
-) -> Tuple[int, Optional[cv2.VideoWriter]]:
+class _OrderedChunkWriter:
     """
-    Stitch one timeline segment's spilled chunks with overlap blending and stream to disk.
+    Reorder stage + writer: accepts completed chunks in any order, emits them in
+    sequence order to the video/PNG writer, and releases each spill file as soon
+    as its frames are written.
 
-    Segments must be flushed in ascending timeline order (the caller is responsible for
-    this) so that output frames stay temporally ordered. `state` carries `pending_tail` (the
-    previous segment's trailing overlap frames, held back until blended against this
-    segment's first chunk) and `frames_to_skip` (remaining prepend-frame trim) across calls
-    so that each segment's chunks can be stitched and deleted as soon as that segment
-    finishes, instead of waiting for the entire video to be spilled to disk first.
-    `is_last_worker` is True only for the final segment of the whole video.
+    Chunks arrive as control messages, never as pixel data, so the pending map
+    holds only metadata; the payload stays on disk until this stage reads it.
+    Overlap context is trimmed by the worker before spilling (prepend-and-trim),
+    so chunks are already non-overlapping here and simply concatenate in order.
+
+    `retire_callback` is invoked with the sequence number once a chunk has been
+    written and its spill file deleted, so the coordinator can return its
+    in-flight credit.
     """
-    frames_written = 0
-    overlap = args.temporal_overlap
-    pix_fmt = pix_fmt or _resolve_pix_fmt(args)
-    codec = codec or _resolve_codec(args)
 
-    def write_out(chunk_tensor: torch.Tensor) -> int:
-        nonlocal writer
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        fps: float,
+        output_path: str,
+        base_name: str,
+        pix_fmt: Optional[str] = None,
+        codec: Optional[str] = None,
+        retire_callback: Optional[Any] = None
+    ) -> None:
+        self.args = args
+        self.fps = fps
+        self.output_path = output_path
+        self.base_name = base_name
+        self.pix_fmt = pix_fmt or _resolve_pix_fmt(args)
+        self.codec = codec or _resolve_codec(args)
+        self.retire_callback = retire_callback
+
+        self.writer: Optional[cv2.VideoWriter] = None
+        self.frames_written = 0
+        self.next_seq = 0
+        self.pending: Dict[int, Dict[str, Any]] = {}
+        self.frames_to_skip = args.prepend_frames
+
+    def submit(self, message: Dict[str, Any]) -> None:
+        """
+        Accept a completed chunk. Always stores the message, then flushes any
+        contiguous run starting at next_seq. Never blocks on ordering.
+        """
+        self.pending[message["seq"]] = message
+        self._flush_ready()
+
+    def _flush_ready(self) -> None:
+        while self.next_seq in self.pending:
+            message = self.pending.pop(self.next_seq)
+            self._write_chunk(message)
+            self.next_seq += 1
+
+    def _write_chunk(self, message: Dict[str, Any]) -> None:
+        chunk_path = message["chunk_path"]
+        try:
+            chunk_np = _load_spilled_chunk(chunk_path, self.args.output_bitdepth)
+            chunk_tensor = torch.from_numpy(chunk_np)
+            self._write_out(chunk_tensor)
+            del chunk_tensor, chunk_np
+            gc.collect()
+        finally:
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+            if self.retire_callback is not None:
+                self.retire_callback(message["seq"])
+
+    def _write_out(self, chunk_tensor: torch.Tensor) -> None:
         if chunk_tensor.numel() == 0:
-            return 0
-        if state["frames_to_skip"] > 0:
-            if chunk_tensor.shape[0] <= state["frames_to_skip"]:
-                state["frames_to_skip"] -= chunk_tensor.shape[0]
-                return 0
-            chunk_tensor = chunk_tensor[state["frames_to_skip"]:]
-            state["frames_to_skip"] = 0
-        if args.output_format == "png":
-            return save_frames_to_image(chunk_tensor, output_path, base_name, start_index=frames_written)
-        _log_ram_usage(debug, "Stitch write_out pre-video", force=True)
+            return
+        # prepend_frames applies only to the very start of the video
+        if self.frames_to_skip > 0:
+            if chunk_tensor.shape[0] <= self.frames_to_skip:
+                self.frames_to_skip -= chunk_tensor.shape[0]
+                return
+            chunk_tensor = chunk_tensor[self.frames_to_skip:]
+            self.frames_to_skip = 0
+
+        if self.args.output_format == "png":
+            self.frames_written += save_frames_to_image(
+                chunk_tensor, self.output_path, self.base_name, start_index=self.frames_written
+            )
+            return
+
         writer_local = save_frames_to_video(
             chunk_tensor,
-            output_path,
-            fps,
-            writer=writer,
-            video_backend=args.video_backend,
-            use_10bit=args.use_10bit or args.output_bitdepth > 8,
-            codec=codec,
-            pix_fmt=pix_fmt,
-            bitrate=args.video_bitrate,
-            crf=args.video_crf,
-            preset=args.video_preset,
-            input_bitdepth=args.output_bitdepth
+            self.output_path,
+            self.fps,
+            writer=self.writer,
+            video_backend=self.args.video_backend,
+            use_10bit=self.args.use_10bit or self.args.output_bitdepth > 8,
+            codec=self.codec,
+            pix_fmt=self.pix_fmt,
+            bitrate=self.args.video_bitrate,
+            crf=self.args.video_crf,
+            preset=self.args.video_preset,
+            input_bitdepth=self.args.output_bitdepth
         )
-        _log_ram_usage(debug, "Stitch write_out post-video", force=True)
-        if writer is None:
-            writer = writer_local
-        return chunk_tensor.shape[0]
+        if self.writer is None:
+            self.writer = writer_local
+        self.frames_written += chunk_tensor.shape[0]
 
-    chunk_paths = sorted(chunk_paths)
-    for chunk_idx, chunk_path in enumerate(chunk_paths):
-        chunk_np = _load_spilled_chunk(chunk_path, args.output_bitdepth)
-        chunk_tensor = torch.from_numpy(chunk_np)
-        is_last_chunk = chunk_idx == len(chunk_paths) - 1
+    def finish(self, expected_total: Optional[int] = None) -> int:
+        """
+        Verify the stream completed and close the writer. A gap here means a
+        chunk was lost, which must surface as an error rather than a short video.
+        """
+        if expected_total is not None and self.next_seq != expected_total:
+            missing = sorted(set(range(expected_total)) - set(range(self.next_seq)) - set(self.pending))
+            raise RuntimeError(
+                f"Output incomplete: wrote {self.next_seq}/{expected_total} chunks in order"
+                + (f", first missing seq {missing[0]}" if missing else "")
+            )
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+        return self.frames_written
 
-        pending_tail = state["pending_tail"]
-        if pending_tail is not None:
-            if overlap > 0 and chunk_tensor.shape[0] > 0:
-                blend_len = min(overlap, pending_tail.shape[0], chunk_tensor.shape[0])
-                blended = blend_overlapping_frames(
-                    pending_tail[-blend_len:],
-                    chunk_tensor[:blend_len],
-                    blend_len
-                )
-                frames_written += write_out(blended)
-                chunk_tensor = chunk_tensor[blend_len:]
-            else:
-                frames_written += write_out(pending_tail)
-            state["pending_tail"] = None
-
-        if not is_last_worker and overlap > 0 and is_last_chunk:
-            if chunk_tensor.shape[0] <= overlap:
-                state["pending_tail"] = chunk_tensor
-                chunk_body = chunk_tensor[:0]
-            else:
-                state["pending_tail"] = chunk_tensor[-overlap:]
-                chunk_body = chunk_tensor[:-overlap]
-        else:
-            chunk_body = chunk_tensor
-
-        if chunk_body.numel() > 0:
-            frames_written += write_out(chunk_body)
-
-        try:
-            os.remove(chunk_path)
-        except OSError:
-            pass
-        del chunk_tensor, chunk_np
-        gc.collect()
-
-    if is_last_worker and state["pending_tail"] is not None:
-        frames_written += write_out(state["pending_tail"])
-        state["pending_tail"] = None
-
-    return frames_written, writer
+    def abort(self) -> None:
+        """Release the writer and drop pending spill files without writing them."""
+        if self.writer is not None:
+            try:
+                self.writer.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self.writer = None
+        for message in self.pending.values():
+            try:
+                os.remove(message["chunk_path"])
+            except OSError:
+                pass
+        self.pending.clear()
 
 
 # =============================================================================
@@ -1436,100 +1467,168 @@ def _process_frames_core(
 
 
 def _worker_process(
-    proc_idx: int, 
-    device_id: str, 
+    proc_idx: int,
+    device_id: str,
     frames_np: Optional[np.ndarray],
-    shared_args: Dict[str, Any], 
+    shared_args: Dict[str, Any],
     return_queue: mp.Queue,
     done_barrier: Optional[mp.Barrier],
-    video_info: Optional[Dict[str, Any]] = None
+    video_info: Optional[Dict[str, Any]] = None,
+    work_queue: Optional[mp.Queue] = None
 ) -> None:
     """
     Worker process for multi-GPU upscaling.
-    
+
     Supports two modes:
     1. frames_np provided: Process pre-loaded frames (for images)
-    2. video_info provided: Stream video segment internally (for videos)
-       - Each worker opens the video, seeks to its assigned range, and streams
-         with internal chunking and model caching for memory efficiency
-    
+    2. work_queue provided: Pull numbered chunk work items off a shared queue,
+       process each one, spill it to disk, and report (seq, chunk_path) back.
+       Work items carry their own frame range, so the worker holds no notion of
+       "its segment" and any worker can take any item.
+
     Args:
-        proc_idx: Worker index for result ordering
+        proc_idx: Worker index, used for logging and spill-directory naming
         device_id: GPU device ID (used for CUDA_VISIBLE_DEVICES inheritance)
         frames_np: Pre-loaded frames as numpy array, or None for video streaming
         shared_args: Serialized args namespace as dict
-        return_queue: Queue for returning results to parent
+        return_queue: Queue for returning results/errors to parent
         done_barrier: Barrier for synchronizing shared memory handoff
-        video_info: Optional dict with 'video_path', 'start_frame', 'end_frame'
-                   for video streaming mode
+        video_info: Unused in queue mode; retained for the pre-loaded-frames path
+        work_queue: Shared queue of chunk work items; None terminates the worker
     """
     # Create debug instance for this worker
     worker_debug = Debug(enabled=shared_args["debug"])
     
     args = argparse.Namespace(**shared_args)
     
-    # Video streaming mode: worker reads and processes its assigned segment
-    if video_info is not None:
-        cap = cv2.VideoCapture(video_info['video_path'])
-        cap.set(cv2.CAP_PROP_POS_FRAMES, video_info['start_frame'])
-        
-        segment_frames = video_info['end_frame'] - video_info['start_frame']
-        chunk_size = args.chunk_size if args.chunk_size > 0 else segment_frames
-        
-        worker_debug.log(f"GPU {proc_idx}: frames {video_info['start_frame']}-{video_info['end_frame']} "
-                        f"({segment_frames} frames, chunks of {chunk_size})",
-                        category="generation", force=True)
-        
-        # Only GPU 0 uses prepend_frames (applies to video start only)
-        worker_args = argparse.Namespace(**vars(args))
-        if proc_idx != 0:
-            worker_args.prepend_frames = 0
-        
-        # Disable runner caching per chunk to avoid CPU accumulation; reload models per chunk
-        runner_cache = None
-        
-        total_chunks = (segment_frames + chunk_size - 1) // chunk_size
-        chunk_paths: List[str] = []
+    # Queue-driven streaming mode: pull work items until the sentinel arrives.
+    if work_queue is not None:
+        # Pin this child to its GPU here rather than in the parent: proxies
+        # respawn independently, so mutating the parent's environment around
+        # each spawn would race between concurrent restarts.
+        os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+        worker_debug.log(f"Worker {proc_idx} (GPU {device_id}) ready", category="generation", force=True)
         spill_root = shared_args.get("spill_dir")
         if spill_root is None:
             raise RuntimeError("spill_dir not provided for streaming worker")
-        cycle_subdir = video_info.get("cycle_subdir", "")
-        worker_spill_dir = os.path.join(spill_root, f"segment_{proc_idx}", cycle_subdir) if cycle_subdir else os.path.join(spill_root, f"segment_{proc_idx}")
+        worker_spill_dir = os.path.join(spill_root, f"worker_{proc_idx}")
         os.makedirs(worker_spill_dir, exist_ok=True)
 
-        for chunk_idx, result in enumerate(_stream_video_chunks(
-                cap=cap,
-                frames_to_process=segment_frames,
-                chunk_size=chunk_size,
-                overlap=args.temporal_overlap,
-                args=worker_args,
-                device_id="0",
-                debug=worker_debug,
-                runner_cache=runner_cache,
-                log_progress=total_chunks > 1,
-                total_chunks=total_chunks,
-                log_prefix=f"[GPU {proc_idx}] "
-            ), start=1):
-            storage_tensor = _convert_tensor_for_storage(result.cpu(), args.output_bitdepth)
-            chunk_path = os.path.join(worker_spill_dir, f"chunk_{chunk_idx:05d}.npy")
-            try:
-                _log_ram_usage(worker_debug, f"Worker {proc_idx} chunk {chunk_idx} pre-save ({storage_tensor.shape}, {storage_tensor.dtype})", force=True)
-                _save_chunk_with_retry(storage_tensor.numpy(), chunk_path, worker_debug)
-                chunk_paths.append(chunk_path)
-                _log_ram_usage(worker_debug, f"Worker {proc_idx} chunk {chunk_idx} post-save", force=True)
-            except Exception as exc:  # noqa: BLE001
+        cap: Optional[cv2.VideoCapture] = None
+        video_path: Optional[str] = None
+        chunks_done = 0
+        recycle_every = max(0, getattr(args, "recycle_workers_every", 0))
+
+        try:
+            while True:
+                item = work_queue.get()
+                if item is None:  # sentinel: no more work
+                    break
+
+                seq = item["seq"]
+                read_start = item["read_start"]
+                read_count = item["read_count"]
+                context_count = item["context_count"]
+
+                # (Re)open the capture; a recycle boundary drops it so the next
+                # item starts from a clean seek.
+                if cap is None or video_path != item["video_path"]:
+                    if cap is not None:
+                        cap.release()
+                    video_path = item["video_path"]
+                    cap = cv2.VideoCapture(video_path)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, read_start)
+
+                # prepend_frames only applies at the true start of the video.
+                item_args = argparse.Namespace(**vars(args))
+                if seq != 0:
+                    item_args.prepend_frames = 0
+
+                try:
+                    # One work item is exactly one chunk, so overlap=0 here: the
+                    # item's read range already includes its leading context
+                    # frames, and they are trimmed off the result below.
+                    result = None
+                    for produced in _stream_video_chunks(
+                        cap=cap,
+                        frames_to_process=read_count,
+                        chunk_size=read_count,
+                        overlap=0,
+                        args=item_args,
+                        device_id="0",
+                        debug=worker_debug,
+                        runner_cache=None,
+                        log_progress=False,
+                        log_prefix=f"[seq {seq}] "
+                    ):
+                        result = produced
+                        break
+
+                    if result is None:
+                        raise RuntimeError(
+                            f"no frames produced for seq {seq} "
+                            f"(read_start={read_start}, read_count={read_count})"
+                        )
+
+                    # Trim the leading context frames this item prepended for
+                    # temporal continuity; they belong to the previous chunk.
+                    if context_count > 0:
+                        if result.shape[0] <= context_count:
+                            raise RuntimeError(
+                                f"seq {seq} produced {result.shape[0]} frames, "
+                                f"fewer than its {context_count} context frames"
+                            )
+                        result = result[context_count:]
+
+                    storage_tensor = _convert_tensor_for_storage(result.cpu(), args.output_bitdepth)
+                    chunk_path = os.path.join(worker_spill_dir, f"chunk_{seq:06d}.npy")
+                    _log_ram_usage(
+                        worker_debug,
+                        f"Worker {proc_idx} seq {seq} pre-save ({tuple(storage_tensor.shape)}, {storage_tensor.dtype})",
+                        force=True
+                    )
+                    _save_chunk_with_retry(storage_tensor.numpy(), chunk_path, worker_debug)
+                    frame_count = int(storage_tensor.shape[0])
+                    del result, storage_tensor
+                except Exception as exc:  # noqa: BLE001
+                    if return_queue is not None:
+                        return_queue.put({
+                            "type": "error",
+                            "worker": proc_idx,
+                            "seq": seq,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc(),
+                        })
+                    return
+                finally:
+                    clear_memory(debug=worker_debug, deep=True, force=True, timer_name="worker_chunk_cleanup")
+                    gc.collect()
+
                 if return_queue is not None:
-                    return_queue.put((proc_idx, {"error": str(exc)}))
-                return
-            finally:
-                del result, storage_tensor
-                clear_memory(debug=worker_debug, deep=True, force=True, timer_name="worker_chunk_cleanup")
-                _log_ram_usage(worker_debug, f"Worker {proc_idx} chunk {chunk_idx} after cleanup", force=True)
-                gc.collect()
-        
-        cap.release()
+                    return_queue.put({
+                        "type": "result",
+                        "worker": proc_idx,
+                        "seq": seq,
+                        "chunk_path": chunk_path,
+                        "frame_count": frame_count,
+                    })
+
+                chunks_done += 1
+                # Recycle: drop the capture and free everything this process
+                # accumulated. The parent respawns us; from the queue's point of
+                # view we simply stop asking for work for a moment.
+                if recycle_every and chunks_done >= recycle_every:
+                    worker_debug.log(
+                        f"Worker {proc_idx} recycling after {chunks_done} chunks",
+                        category="memory", force=True
+                    )
+                    break
+        finally:
+            if cap is not None:
+                cap.release()
+
         if return_queue is not None:
-            return_queue.put((proc_idx, chunk_paths))
+            return_queue.put({"type": "exit", "worker": proc_idx, "chunks_done": chunks_done})
         return
     
     # Pre-loaded frames mode (original behavior)
@@ -1582,6 +1681,389 @@ def _single_gpu_direct_processing(
     )
 
 
+# How many times the coordinator will revive a fully-idle worker pool before
+# treating it as a fatal error. Guards against an infinite respawn loop when
+# workers die immediately on startup.
+_MAX_POOL_REVIVALS = 3
+
+
+def _plan_chunk_work(
+    video_path: str,
+    start_frame: int,
+    total_frames: int,
+    chunk_size: int,
+    overlap: int
+) -> List[Dict[str, Any]]:
+    """
+    Build the ordered list of chunk work items covering the whole job.
+
+    Each item is self-describing: the reader hands it out and any worker can
+    take it. Overlap is handled by prepend-and-trim -- an item reads `overlap`
+    extra frames before its own range for temporal continuity and the worker
+    trims them off after processing, so what gets spilled is exactly the item's
+    own payload and chunks concatenate without blending.
+    """
+    items: List[Dict[str, Any]] = []
+    end_of_video = start_frame + total_frames
+    seq = 0
+    payload_start = start_frame
+    while payload_start < end_of_video:
+        payload_end = min(payload_start + chunk_size, end_of_video)
+        context_count = min(overlap, payload_start - start_frame)
+        read_start = payload_start - context_count
+        items.append({
+            "seq": seq,
+            "video_path": video_path,
+            "read_start": read_start,
+            "read_count": payload_end - read_start,
+            "context_count": context_count,
+            "payload_frames": payload_end - payload_start,
+        })
+        payload_start = payload_end
+        seq += 1
+    return items
+
+
+def _run_chunk_pipeline(
+    device_list: List[str],
+    args: argparse.Namespace,
+    video_info: Dict[str, Any],
+    spill_dir: str,
+    output_path: str,
+    fps: float,
+    base_name: str,
+    shared_args: Dict[str, Any],
+    return_queue: mp.Queue,
+) -> Dict[str, Any]:
+    """
+    Coordinator: numbered chunks flow through a pool of worker processes and are
+    written back out in sequence order.
+
+    The invariant that bounds storage is a global in-flight credit window:
+
+        dispatched_not_retired <= window
+
+    A credit is spent when an item is dispatched and returned only once that
+    chunk has been written in order and its spill file deleted. Everything not
+    yet through the writer -- queued items, work on a GPU, spill files, entries
+    in the reorder map -- lives inside that window, so peak disk is bounded by
+    `window` chunks regardless of how long the video is.
+    """
+    num_devices = len(device_list)
+    total_frames = video_info["frames_to_process"]
+    start_frame = video_info["start_frame"]
+    video_path = video_info["video_path"]
+
+    chunk_size = args.chunk_size if args.chunk_size > 0 else max(1, -(-total_frames // num_devices))
+    work_items = _plan_chunk_work(
+        video_path=video_path,
+        start_frame=start_frame,
+        total_frames=total_frames,
+        chunk_size=chunk_size,
+        overlap=args.temporal_overlap,
+    )
+    total_items = len(work_items)
+
+    window = _initial_inflight_window(args, num_devices)
+    debug.log(
+        f"Chunk pipeline: {total_items} chunks of {chunk_size} frames across {num_devices} GPUs, "
+        f"in-flight window {window}",
+        category="info", force=True
+    )
+
+    # Bounded so a burst of completions can't outrun the writer; the credit
+    # window is what actually bounds disk, this is local backpressure only.
+    # Sized generously since the window, not this queue, is the real limit.
+    work_queue: mp.Queue = mp.Queue(maxsize=max(1, 2 * window))
+
+    writer_stage = _OrderedChunkWriter(
+        args=args,
+        fps=fps,
+        output_path=output_path,
+        base_name=base_name,
+        pix_fmt=_resolve_pix_fmt(args),
+        codec=_resolve_codec(args),
+    )
+
+    proxies = [
+        _WorkerProxy(
+            proc_idx=idx,
+            device_id=device_list[idx],
+            shared_args=shared_args,
+            work_queue=work_queue,
+            return_queue=return_queue,
+        )
+        for idx in range(num_devices)
+    ]
+
+    next_to_dispatch = 0
+    in_flight = 0
+    retired = 0
+    revivals = 0
+    failure: Optional[Dict[str, Any]] = None
+    measured = False
+
+    def on_retire(_seq: int) -> None:
+        """A chunk is written and its spill file gone: return its credit."""
+        nonlocal in_flight, retired
+        in_flight -= 1
+        retired += 1
+
+    writer_stage.retire_callback = on_retire
+
+    def dispatch_ready() -> None:
+        """Spend credits to fill the queue, up to the window."""
+        nonlocal next_to_dispatch, in_flight
+        while next_to_dispatch < total_items and in_flight < window:
+            try:
+                work_queue.put(work_items[next_to_dispatch], timeout=0.1)
+            except queue.Full:
+                return
+            next_to_dispatch += 1
+            in_flight += 1
+
+    try:
+        for proxy in proxies:
+            proxy.start()
+
+        dispatch_ready()
+
+        while retired < total_items:
+            try:
+                message = return_queue.get(timeout=5.0)
+            except queue.Empty:
+                # Nothing arrived. If the pool has gone empty with work still
+                # outstanding, revive it once rather than hanging: a worker that
+                # died silently is a real failure, but a pool that all recycled
+                # at the same instant is recoverable.
+                if not any(p.is_alive() for p in proxies):
+                    if revivals < _MAX_POOL_REVIVALS:
+                        revivals += 1
+                        debug.log(
+                            f"Worker pool went idle with {total_items - retired} chunks outstanding; "
+                            f"restarting it (revival {revivals}/{_MAX_POOL_REVIVALS})",
+                            category="warning", force=True
+                        )
+                        for proxy in proxies:
+                            proxy.join(timeout=5.0)
+                            proxy.restart()
+                        continue
+                    failure = {"error": "worker pool repeatedly exited before the job completed"}
+                    break
+                continue
+
+            kind = message.get("type")
+
+            if kind == "error":
+                failure = message
+                break
+
+            if kind == "exit":
+                # Worker hit a recycle boundary. Respawn while chunks remain
+                # that the still-running workers cannot already cover. Keying
+                # this on dispatch progress instead would strand queued items
+                # whenever the whole pool recycles at once near the end; the
+                # live-worker term just avoids paying model-load cost for a
+                # worker that would have nothing left to do.
+                proxy = proxies[message["worker"]]
+                proxy.join()
+                outstanding = total_items - retired
+                others_alive = sum(1 for p in proxies if p is not proxy and p.is_alive())
+                if outstanding > others_alive:
+                    proxy.restart()
+                continue
+
+            if kind == "result":
+                if not measured:
+                    measured = True
+                    try:
+                        chunk_bytes = os.path.getsize(message["chunk_path"])
+                    except OSError:
+                        chunk_bytes = 0
+                    window = _tighten_window_from_measurement(
+                        args, window, num_devices, chunk_bytes
+                    )
+                # submit() writes any contiguous run it can, calling on_retire
+                # for each chunk it finishes -- that is where credits come back.
+                writer_stage.submit(message)
+                dispatch_ready()
+                continue
+
+        frames_written = 0
+        if failure is None:
+            # Retire the pool cleanly: drain leftover items first so nothing
+            # sits ahead of the sentinels, then give every worker one.
+            _drain_queue(work_queue)
+            for _ in proxies:
+                try:
+                    work_queue.put(None, timeout=1.0)
+                except queue.Full:
+                    break
+            for proxy in proxies:
+                proxy.join(timeout=30.0)
+            frames_written = writer_stage.finish(expected_total=total_items)
+        else:
+            # Fatal error: stop the workers before touching the output so no
+            # late spill file lands after cleanup.
+            for proxy in proxies:
+                proxy.terminate()
+            writer_stage.abort()
+
+    except BaseException:
+        # Ctrl-C and anything unexpected take the same path as a fatal error:
+        # stop the pool, drop partial output, let the exception propagate.
+        for proxy in proxies:
+            proxy.terminate()
+        writer_stage.abort()
+        raise
+    finally:
+        for proxy in proxies:
+            proxy.shutdown()
+        _drain_queue(work_queue)
+        _drain_queue(return_queue)
+
+    if failure is not None:
+        detail = failure.get("traceback") or failure.get("error", "unknown error")
+        seq = failure.get("seq")
+        where = f" while processing chunk {seq}" if seq is not None else ""
+        raise RuntimeError(f"Worker {failure.get('worker', '?')} failed{where}:\n{detail}")
+
+    return {"frames_written": frames_written}
+
+
+def _initial_inflight_window(args: argparse.Namespace, num_devices: int) -> int:
+    """
+    Starting size for the in-flight credit window.
+
+    An explicit --inflight_chunks is authoritative. Otherwise start at a floor
+    that keeps every GPU fed; if --spill_budget_gb is set, the window is
+    re-derived once the first chunk lands and its real serialized size is known
+    (see _tighten_window_from_measurement) rather than guessed from output
+    dimensions the orchestration layer cannot compute up front.
+    """
+    floor = max(2 * num_devices, num_devices + 1)
+    explicit = getattr(args, "inflight_chunks", 0)
+    if explicit and explicit > 0:
+        return max(explicit, num_devices)
+    return floor
+
+
+def _tighten_window_from_measurement(
+    args: argparse.Namespace,
+    current_window: int,
+    num_devices: int,
+    chunk_bytes: int
+) -> int:
+    """
+    Re-derive the window from --spill_budget_gb using a measured chunk size.
+
+    Called once, after the first chunk is spilled. Returns the window unchanged
+    when no budget is set, when the user pinned --inflight_chunks, or when the
+    budget is already satisfied.
+    """
+    if getattr(args, "inflight_chunks", 0):
+        return current_window
+    budget_gb = getattr(args, "spill_budget_gb", 0.0)
+    if not budget_gb or budget_gb <= 0 or chunk_bytes <= 0:
+        return current_window
+
+    floor = max(num_devices + 1, 2)
+    # Reserve one chunk's worth of headroom for the in-progress write.
+    derived = int((budget_gb * (1024 ** 3)) // chunk_bytes) - 1
+
+    if derived < floor:
+        debug.log(
+            f"--spill_budget_gb {budget_gb:g} allows only {max(derived, 0)} chunks in flight at "
+            f"{chunk_bytes / (1024 ** 2):.0f} MB/chunk; holding {floor} to keep the GPUs fed. "
+            f"Peak spill will exceed the budget -- lower --chunk_size to respect it.",
+            category="warning", force=True
+        )
+        return floor
+
+    if derived < current_window:
+        debug.log(
+            f"Tightening in-flight window {current_window} -> {derived} from measured "
+            f"{chunk_bytes / (1024 ** 2):.0f} MB/chunk against {budget_gb:g} GB budget "
+            f"(peak spill ~{derived * chunk_bytes / (1024 ** 3):.2f} GB)",
+            category="memory", force=True
+        )
+        return derived
+    return current_window
+
+
+def _drain_queue(q: mp.Queue) -> None:
+    """Empty a queue so its feeder thread can exit and the process can join."""
+    try:
+        while True:
+            q.get_nowait()
+    except Exception:  # noqa: BLE001 - queue.Empty and closed-queue errors alike
+        pass
+
+
+class _WorkerProxy:
+    """
+    One GPU's worker, behind a stable interface.
+
+    The child process is disposable -- it exits on a recycle boundary to shed
+    accumulated memory, and this proxy respawns it. Nothing outside needs to
+    know that happened: a recycling proxy is simply not pulling from the shared
+    work queue for a few seconds, which is indistinguishable from being busy.
+    """
+
+    def __init__(
+        self,
+        proc_idx: int,
+        device_id: str,
+        shared_args: Dict[str, Any],
+        work_queue: mp.Queue,
+        return_queue: mp.Queue,
+    ) -> None:
+        self.proc_idx = proc_idx
+        self.device_id = device_id
+        self.shared_args = shared_args
+        self.work_queue = work_queue
+        self.return_queue = return_queue
+        self.process: Optional[mp.Process] = None
+        self.generation = 0
+
+    def start(self) -> None:
+        # The child pins itself to device_id; doing it here would race with
+        # other proxies restarting concurrently.
+        self.process = mp.Process(
+            target=_worker_process,
+            args=(self.proc_idx, self.device_id, None, self.shared_args, self.return_queue, None),
+            kwargs={"work_queue": self.work_queue},
+            daemon=False,
+        )
+        self.process.start()
+
+    def restart(self) -> None:
+        self.generation += 1
+        self.start()
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.is_alive()
+
+    def join(self, timeout: float = 30.0) -> None:
+        if self.process is not None:
+            self.process.join(timeout=timeout)
+
+    def terminate(self) -> None:
+        if self.process is not None and self.process.is_alive():
+            self.process.terminate()
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        if self.process is None:
+            return
+        self.process.join(timeout=timeout)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=5.0)
+        if self.process.is_alive():
+            self.process.kill()
+
+
+
 def _gpu_processing(
     frames_tensor: Optional[torch.Tensor],
     device_list: List[str], 
@@ -1614,130 +2096,28 @@ def _gpu_processing(
     """
     num_devices = len(device_list)
     overlap = args.temporal_overlap
-    
+
     return_queue = mp.Queue(maxsize=0)
     done_barrier: Optional[mp.Barrier] = None if video_info is not None and spill_dir else mp.Barrier(num_devices + 1)
     workers = []
     shared_args = vars(args).copy()
     if spill_dir:
         shared_args["spill_dir"] = spill_dir
-    
-    # Video streaming mode: distribute frame ranges to workers round-robin, one
-    # contiguous segment per device per round, in ascending timeline order.
-    recycle_every = max(1, getattr(args, "recycle_workers_every", 1))
+
+    # Queue-driven streaming mode: numbered chunks flow through a worker pool,
+    # bounded by a global in-flight credit window.
     if video_info is not None and spill_dir:
-        total_frames = video_info['frames_to_process']
-        start_frame = video_info['start_frame']
-        video_path = video_info['video_path']
-
-        cycle_span = (args.chunk_size if args.chunk_size > 0 else max(1, -(-total_frames // num_devices)))
-        cycle_span *= recycle_every
-
-        # Build the full ordered list of timeline segments up front (round-robin: segment i
-        # is handled by device i % num_devices). Every non-final segment is extended by
-        # `overlap` extra frames past its nominal end so it shares real source-video frames
-        # with the next segment's head, matching the pre-existing per-GPU-seam blending
-        # design in _stitch_worker_chunks -- just generalized to every segment boundary
-        # instead of only the num_devices-1 GPU-to-GPU boundaries.
-        segments = []
-        seg_start = start_frame
-        end_of_video = start_frame + total_frames
-        seg_idx = 0
-        while seg_start < end_of_video:
-            nominal_end = min(seg_start + cycle_span, end_of_video)
-            is_final_segment = nominal_end >= end_of_video
-            final_end = nominal_end if is_final_segment else min(nominal_end + overlap, end_of_video)
-            segments.append({
-                "seg_idx": seg_idx,
-                "start": seg_start,
-                "end": final_end,
-            })
-            seg_start = nominal_end
-            seg_idx += 1
-
-        last_seg_idx = len(segments) - 1
-        pix_fmt = _resolve_pix_fmt(args)
-        codec = _resolve_codec(args)
-        writer = None
-        stitch_state: Dict[str, Any] = {"pending_tail": None, "frames_to_skip": args.prepend_frames}
-        frames_written = 0
-
-        # Process rounds of up to num_devices segments (in timeline order) at a time.
-        # Each round's segments are stitched and their spilled chunks deleted immediately
-        # after that round completes, before the next round is dispatched. This bounds
-        # spill-dir disk usage to roughly one round's worth of frames across all GPUs,
-        # for the entire job -- not just at the end.
-        round_index = 0
-        next_seg = 0
-        while next_seg <= last_seg_idx:
-            round_index += 1
-            round_segments = segments[next_seg:next_seg + num_devices]
-            next_seg += len(round_segments)
-
-            workers = []
-            for slot, seg in enumerate(round_segments):
-                device = device_list[slot]
-
-                worker_video_info = {
-                    'video_path': video_path,
-                    'start_frame': seg["start"],
-                    'end_frame': seg["end"],
-                    'cycle_subdir': f"cycle_{round_index:05d}",
-                }
-
-                os.environ["CUDA_VISIBLE_DEVICES"] = device
-                p = mp.Process(
-                    target=_worker_process,
-                    args=(seg["seg_idx"], device, None, shared_args, return_queue, done_barrier),
-                    kwargs={'video_info': worker_video_info}
-                )
-                p.start()
-                workers.append(p)
-
-            monitor_stop = None
-            monitor_thread = None
-            if workers:
-                monitor_stop, monitor_thread = _start_memory_monitor(
-                    [p.pid for p in workers if p.pid],
-                    debug,
-                    label=f"workers_cycle_{round_index}",
-                    interval=10.0
-                )
-
-            round_chunks: Dict[int, List[str]] = {}
-            collected = 0
-            while collected < len(workers):
-                proc_idx, payload = return_queue.get()
-                if isinstance(payload, dict) and "error" in payload:
-                    raise RuntimeError(f"Worker {proc_idx} failed to spill chunk: {payload['error']}")
-                round_chunks[proc_idx] = payload
-                collected += 1
-
-            for p in workers:
-                p.join()
-
-            if monitor_stop:
-                monitor_stop.set()
-                if monitor_thread:
-                    monitor_thread.join(timeout=2.0)
-
-            # Stitch this round's segments in ascending timeline order, then delete.
-            for seg in round_segments:
-                is_last_segment = seg["seg_idx"] == last_seg_idx
-                _log_ram_usage(debug, f"Parent pre-stitch segment {seg['seg_idx']}", force=True)
-                written, writer = _stitch_worker_chunks(
-                    round_chunks[seg["seg_idx"]],
-                    args, fps, output_path, base_name,
-                    is_last_worker=is_last_segment,
-                    writer=writer, pix_fmt=pix_fmt, codec=codec,
-                    state=stitch_state
-                )
-                frames_written += written
-                _log_ram_usage(debug, f"Parent post-stitch segment {seg['seg_idx']}", force=True)
-
-        if writer is not None:
-            writer.release()
-        return {"frames_written": frames_written}
+        return _run_chunk_pipeline(
+            device_list=device_list,
+            args=args,
+            video_info=video_info,
+            spill_dir=spill_dir,
+            output_path=output_path,
+            fps=fps,
+            base_name=base_name,
+            shared_args=shared_args,
+            return_queue=return_queue,
+        )
     
     # Pre-loaded frames mode (original behavior for images or non-streaming)
     else:
@@ -1929,7 +2309,15 @@ Examples:
                         help="ffmpeg preset (default: medium)")
     io_group.add_argument("--recycle_workers_every", type=int, default=1,
                         help="Chunks processed per worker before recycling (respawn). "
-                             "Default: 1 (recycle every chunk). Increase to reuse workers across chunks at the cost of higher peak RAM.")
+                             "Default: 1 (recycle every chunk). Increase to reuse workers across chunks at the cost of higher peak RAM. "
+                             "0 disables recycling entirely.")
+    io_group.add_argument("--inflight_chunks", type=int, default=0,
+                        help="Multi-GPU: maximum chunks in flight at once (dispatched but not yet written). "
+                             "Bounds peak spill-directory usage to roughly this many chunks. "
+                             "0 = derive from --spill_budget_gb, or 2x GPU count if that is unset.")
+    io_group.add_argument("--spill_budget_gb", type=float, default=0.0,
+                        help="Multi-GPU: target ceiling in GB for the spill directory. Sizes --inflight_chunks "
+                             "automatically from the chunk size. Ignored if --inflight_chunks is set explicitly.")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
