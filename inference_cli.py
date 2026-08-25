@@ -439,7 +439,11 @@ def _parse_offload_device(offload_arg: str, platform_type: str = None, cache_ena
 # =============================================================================
 
 # Supported file extensions
-VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v'}
+# Containers OpenCV cannot necessarily decode itself; the H.264 transcode stage
+# normalizes them first, so recognizing them here is what lets that stage run.
+VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v',
+                    '.rm', '.rmvb', '.mpg', '.mpeg', '.m2ts', '.ts', '.vob',
+                    '.asf', '.ogv', '.divx', '.3gp', '.mts', '.f4v', '.mxf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
 
