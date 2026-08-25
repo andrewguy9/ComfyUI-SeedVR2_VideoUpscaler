@@ -513,6 +513,140 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     return frames_tensor, 30.0  # Default FPS for images
 
 
+def _probe_video_codec(video_path: str) -> Optional[str]:
+    """
+    Read the codec name of a video's first video stream via ffprobe.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Lowercase codec name (e.g. "h264", "hevc", "vp9"), or None if ffprobe
+        is unavailable, fails, or reports no video stream. None means "unknown",
+        never "not h264" -- callers must not treat it as a transcode trigger.
+    """
+    if shutil.which("ffprobe") is None:
+        return None
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (subprocess.SubprocessError, OSError) as exc:
+        debug.log(f"ffprobe failed for {Path(video_path).name}: {exc}",
+                  level="WARNING", category="file")
+        return None
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        debug.log(f"ffprobe returned {completed.returncode} for {Path(video_path).name}: {stderr}",
+                  level="WARNING", category="file")
+        return None
+
+    codec = completed.stdout.strip().splitlines()
+    return codec[0].strip().lower() if codec and codec[0].strip() else None
+
+
+def _transcode_to_h264(input_path: str, output_path: str, args: argparse.Namespace) -> None:
+    """
+    Re-encode a video's picture to H.264, preserving frame count and rate.
+
+    Audio is dropped: this file exists only to be decoded frame-by-frame, and
+    nothing downstream reads its audio track, so encoding one is wasted time.
+
+    Runs ffmpeg to completion (this is a blocking, whole-file pass -- expect it
+    to take roughly as long as a normal encode of the source).
+
+    Args:
+        input_path: Source video
+        output_path: Destination path; overwritten if it exists
+        args: Command-line arguments; supplies --transcode_crf and --transcode_preset
+
+    Raises:
+        RuntimeError: If ffmpeg exits non-zero or produces no output file
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", args.transcode_preset,
+        "-crf", str(args.transcode_crf),
+        "-pix_fmt", "yuv420p",
+        "-an",
+        output_path,
+    ]
+    debug.log(f"Transcoding to H.264: crf={args.transcode_crf} preset={args.transcode_preset}",
+              category="file", force=True, indent_level=1)
+
+    started = time.time()
+    completed = subprocess.run(cmd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        # ffmpeg's real diagnostic is the last few lines; the banner above it is noise.
+        tail = "\n".join(stderr.splitlines()[-10:])
+        raise RuntimeError(f"ffmpeg transcode failed (exit {completed.returncode}):\n{tail}")
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"ffmpeg transcode produced no output at {output_path}")
+
+    elapsed = time.time() - started
+    size = os.path.getsize(output_path)
+    debug.log(f"Transcode complete in {elapsed:.1f}s ({_format_bytes(size)})",
+              category="success", force=True, indent_level=1)
+
+
+def _prepare_h264_source(input_path: str, args: argparse.Namespace) -> Tuple[str, Optional[str]]:
+    """
+    Normalize a video to H.264 if it isn't already, for a decode path that reads
+    it by seeking to arbitrary frame offsets.
+
+    OpenCV's frame-accurate seek (CAP_PROP_POS_FRAMES) is only as reliable as the
+    underlying codec's index; exotic sources are where multi-GPU segment reads go
+    wrong. Re-encoding to a plain H.264 mp4 up front makes every later seek land
+    where the plan says it does.
+
+    Args:
+        input_path: Original source video
+        args: Command-line arguments
+
+    Returns:
+        (path_to_use, temp_dir_to_clean) -- temp_dir_to_clean is None when no
+        transcode happened, in which case path_to_use is input_path unchanged.
+    """
+    if not getattr(args, "transcode_to_h264", True):
+        return input_path, None
+
+    codec = _probe_video_codec(input_path)
+    if codec is None:
+        debug.log("Could not determine input codec; using the source as-is",
+                  category="file", indent_level=1)
+        return input_path, None
+    if codec == "h264":
+        debug.log("Input is already H.264; skipping transcode", category="file", indent_level=1)
+        return input_path, None
+
+    if shutil.which("ffmpeg") is None:
+        debug.log(
+            f"Input codec is '{codec}' but ffmpeg is not in PATH; using the source as-is. "
+            "Frame-accurate seeking may be unreliable for this codec.",
+            level="WARNING", category="file", force=True
+        )
+        return input_path, None
+
+    debug.log(f"Input codec is '{codec}', not H.264", category="file", force=True, indent_level=1)
+    temp_dir = tempfile.mkdtemp(prefix="seedvr2_transcode_", dir=args.spill_dir or None)
+    transcoded = os.path.join(temp_dir, f"{Path(input_path).stem}.h264.mp4")
+    try:
+        _transcode_to_h264(input_path, transcoded, args)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    return transcoded, temp_dir
+
+
 def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'unknown']:
     """
     Determine input type from file path.
@@ -591,15 +725,16 @@ def generate_output_path(input_path: str, output_format: str, output_dir: Option
     return str(output_path.resolve())
 
 
-def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
+def process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str],
                        output_path: Optional[str] = None, format_auto_detected: bool = False,
                        runner_cache: Optional[Dict[str, Any]] = None) -> int:
     """
-    Process a single video or image file with optional model caching.
-    
-    For videos, supports streaming mode (chunk_size > 0) which processes in memory-bounded
-    chunks with temporal overlap for seamless transitions between chunks.
-    
+    Process a single video or image file, normalizing non-H.264 video first.
+
+    Thin wrapper around _process_single_file: it owns the lifecycle of the
+    transcoded intermediate (created for non-H.264 video, deleted on every exit
+    path) so the inner function never has to think about cleanup.
+
     Args:
         input_path: Path to input file
         args: Command-line arguments with all processing settings
@@ -607,10 +742,55 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         output_path: Optional explicit output path (auto-generated if None)
         format_auto_detected: Whether output format was auto-detected
         runner_cache: Optional cache dict for model reuse across multiple files
+
+    Returns:
+        Number of frames written to output
+    """
+    source_path = input_path
+    transcode_dir: Optional[str] = None
+
+    if get_input_type(input_path) == "video" and os.path.exists(input_path):
+        source_path, transcode_dir = _prepare_h264_source(input_path, args)
+
+    try:
+        return _process_single_file(
+            input_path, args, device_list,
+            output_path=output_path,
+            format_auto_detected=format_auto_detected,
+            runner_cache=runner_cache,
+            source_path=source_path,
+        )
+    finally:
+        if transcode_dir is not None:
+            shutil.rmtree(transcode_dir, ignore_errors=True)
+            debug.log("Removed transcoded intermediate", category="file")
+
+
+def _process_single_file(input_path: str, args: argparse.Namespace, device_list: List[str], 
+                       output_path: Optional[str] = None, format_auto_detected: bool = False,
+                       runner_cache: Optional[Dict[str, Any]] = None,
+                       source_path: Optional[str] = None) -> int:
+    """
+    Process a single video or image file with optional model caching.
+    
+    For videos, supports streaming mode (chunk_size > 0) which processes in memory-bounded
+    chunks with temporal overlap for seamless transitions between chunks.
+    
+    Args:
+        input_path: Path to input file. Names the output; not necessarily what is decoded.
+        args: Command-line arguments with all processing settings
+        device_list: List of GPU device IDs as strings
+        output_path: Optional explicit output path (auto-generated if None)
+        format_auto_detected: Whether output format was auto-detected
+        runner_cache: Optional cache dict for model reuse across multiple files
+        source_path: Video actually decoded, when it differs from input_path
+                     (i.e. a transcoded H.264 intermediate). Defaults to input_path.
     
     Returns:
         Number of frames written to output
     """
+    if source_path is None:
+        source_path = input_path
     input_type = get_input_type(input_path)
     
     if input_type == "unknown":
@@ -636,9 +816,9 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Video file not found: {input_path}")
         
-        cap = cv2.VideoCapture(input_path)
+        cap = cv2.VideoCapture(source_path)
         if not cap.isOpened():
-            raise ValueError(f"Cannot open video file: {input_path}")
+            raise ValueError(f"Cannot open video file: {source_path}")
         
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -694,7 +874,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         if len(device_list) > 1:
             cap.release()  # Workers will reopen
             video_info = {
-                'video_path': input_path,
+                'video_path': source_path,
                 'start_frame': args.skip_first_frames,
                 'frames_to_process': frames_to_process,
             }
@@ -2463,6 +2643,17 @@ Examples:
     io_group.add_argument("--spill_budget_gb", type=float, default=0.0,
                         help="Multi-GPU: target ceiling in GB for the spill directory. Sizes --inflight_chunks "
                              "automatically from the chunk size. Ignored if --inflight_chunks is set explicitly.")
+    io_group.add_argument("--no_transcode", dest="transcode_to_h264", action="store_false",
+                        help="Do not re-encode non-H.264 input to H.264 before decoding. "
+                             "By default such input is transcoded to a temporary file, because "
+                             "frame-accurate seeking (used by multi-GPU segment reads) is unreliable "
+                             "for many codecs. Requires ffmpeg and ffprobe in PATH.")
+    io_group.add_argument("--transcode_crf", type=int, default=16,
+                        help="CRF for the input H.264 transcode (default: 16, visually lossless). "
+                             "Lower is higher quality and larger. Only affects the temporary "
+                             "intermediate, not the upscaled output.")
+    io_group.add_argument("--transcode_preset", type=str, default="slow",
+                        help="ffmpeg preset for the input H.264 transcode (default: slow)")
     io_group.add_argument("--model_dir", type=str, default=None,
                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")
     
@@ -2639,6 +2830,17 @@ def main() -> None:
         debug.log(f"VAE decode tile overlap ({args.vae_decode_tile_overlap}) must be smaller than tile size ({args.vae_decode_tile_size})", level="ERROR", category="vae", force=True)
         sys.exit(1)
     
+    # Input transcoding needs both tools; warn once here rather than per file
+    if args.transcode_to_h264:
+        missing = [t for t in ("ffprobe", "ffmpeg") if shutil.which(t) is None]
+        if missing:
+            debug.log(
+                f"Input H.264 transcoding is enabled but {', '.join(missing)} not found in PATH. "
+                "Non-H.264 input will be decoded as-is, which can make frame-accurate seeking "
+                "unreliable. Install ffmpeg or pass --no_transcode to silence this.",
+                level="WARNING", category="setup", force=True
+            )
+
     # Validate ffmpeg availability if selected
     if args.video_backend == "ffmpeg" and shutil.which("ffmpeg") is None:
         debug.log("--video_backend ffmpeg requires ffmpeg in PATH. Install ffmpeg or use --video_backend opencv", 
